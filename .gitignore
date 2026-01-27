@@ -1,4 +1,11 @@
 **/.idea/
 **/__pycache__/
-**/.DS_Store/
+**/.DS_Store
+deep_venv/
+venv/
+__pycache__/
+*.DS_Store
 data/
+datasets/
+*.csv
+*.parquet

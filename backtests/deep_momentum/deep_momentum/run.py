@@ -57,7 +57,7 @@ def run_backtest(  # noqa: PLR0913
 
 
 if __name__ == "__main__":
-    from enhanced_momentum.strategies.systematic_momentum import SystematicMomentum
+    from strategies.systematic_momentum import SystematicMomentum
 
     sys_mom = SystematicMomentum(
         mode="long_short",
