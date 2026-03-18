@@ -13,14 +13,16 @@ import torch.nn as nn
 from quant_pml.strategies.factors.sorting_strategy import SortingStrategy
 
 
-class _MLP(nn.Module):
-    def __init__(self, in_dim: int = 3, hidden: int = 32) -> None:
+class _MLPClassifier(nn.Module):
+    def __init__(self, in_dim: int = 3, hidden: int = 64, dropout: float = 0.3) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
 
@@ -28,31 +30,24 @@ class _MLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class SystematicMomentum(SortingStrategy):
-    MACD_PAIRS = [
-        (8, 24), (16, 48), (32, 96),
-        (8, 48), (8, 96), (16, 96),
-        (16, 24), (32, 48),
-    ]
-
+class MLPClassifierMomentum(SortingStrategy):
     def __init__(  # noqa: PLR0913
         self,
         mode: str,
         sign: int = 1,
         *,
-        as_zscore: bool = False,
         quantile: float | None = None,
         n_holdings: int | None = None,
         weighting_scheme: str = "equally_weighted",
         train_months: int = 60,
-        hidden: int = 32,
+        hidden: int = 64,
+        dropout: float = 0.3,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
-        batch_size: int = 8192,
-        epochs_first: int = 5,
-        epochs_update: int = 1,
+        batch_size: int = 4096,
+        epochs_first: int = 10,
+        epochs_update: int = 2,
         exclude_td: int = 21,
-        use_macd: bool = False,
     ) -> None:
         super().__init__(
             quantile=quantile,
@@ -61,24 +56,17 @@ class SystematicMomentum(SortingStrategy):
             weighting_scheme=weighting_scheme,
         )
         self.sign = sign
-        self.as_zscore = as_zscore
-
         self.train_months = train_months
         self.batch_size = batch_size
         self.epochs_first = epochs_first
         self.epochs_update = epochs_update
         self.exclude_td = exclude_td
-        self.use_macd = use_macd
 
         self.device = torch.device("cpu")
-        self.hidden = hidden
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.in_dim = 24 if use_macd else 8
+        self.model = _MLPClassifier(in_dim=3, hidden=hidden, dropout=dropout).to(self.device)
+        self.optim = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        self.model: _MLP | None = None
         self._trained_once = False
-
         self._train_dates: list[pd.Timestamp] = []
         self._X_cache: list[np.ndarray] = []
         self._y_cache: list[np.ndarray] = []
@@ -88,8 +76,7 @@ class SystematicMomentum(SortingStrategy):
     @staticmethod
     def _month_ends(dates: pd.DatetimeIndex) -> list[pd.Timestamp]:
         s = pd.Series(dates, index=dates)
-        month_ends = s.groupby(dates.to_period("M")).max().tolist()
-        return month_ends
+        return s.groupby(dates.to_period("M")).max().tolist()
 
     def _momentum_features_at(self, returns: pd.DataFrame, pos: int) -> pd.DataFrame:
         exc = self.exclude_td
@@ -101,58 +88,15 @@ class SystematicMomentum(SortingStrategy):
         r12 = window_sum(252)
         r6 = window_sum(126)
         r3 = window_sum(63)
-        r1 = window_sum(21)
 
-        vol = returns.iloc[pos - 63 : pos].std(axis=0) * np.sqrt(252)
-        vol = vol.replace(0, np.nan)
-
-        r12_norm = r12 / (vol / np.sqrt(252 / 252))
-        r6_norm = r6 / (vol / np.sqrt(252 / 126))
-        r3_norm = r3 / (vol / np.sqrt(252 / 63))
-
-        X = pd.concat([r12, r6, r3, r1, r12_norm, r6_norm, r3_norm, vol], axis=1)
-        X.columns = ["r12", "r6", "r3", "r1", "r12_norm", "r6_norm", "r3_norm", "vol"]
+        X = pd.concat([r12, r6, r3], axis=1)
+        X.columns = ["r12", "r6", "r3"]
         return X
 
-    def _macd_features_at(self, returns: pd.DataFrame, pos: int) -> pd.DataFrame:
-        lookback = 400
-        start = max(0, pos - lookback)
-        prices = (1 + returns.iloc[start : pos + 1]).cumprod()
-
-        unique_spans = {s for pair in self.MACD_PAIRS for s in pair}
-        ema_cache = {span: prices.ewm(span=span, adjust=False).mean() for span in unique_spans}
-
-        cur_price = prices.iloc[-1].replace(0, np.nan)
-        features = {}
-
-        for fast, slow in self.MACD_PAIRS:
-            macd_series = ema_cache[fast] - ema_cache[slow]
-            macd_val = macd_series.iloc[-1] / cur_price
-
-            signal_period = 9
-            signal_val = macd_series.ewm(span=signal_period, adjust=False).mean().iloc[-1] / cur_price
-
-            features[f"macd_{fast}_{slow}"] = macd_val
-            features[f"signal_{fast}_{slow}"] = signal_val
-
-        return pd.DataFrame(features)
-
-    def _compute_features(self, returns: pd.DataFrame, pos: int) -> pd.DataFrame:
-        mom = self._momentum_features_at(returns, pos)
-        if not self.use_macd:
-            return mom
-        macd = self._macd_features_at(returns, pos)
-        return pd.concat([mom, macd.reindex(mom.index)], axis=1)
-
     def _next_month_target(self, returns: pd.DataFrame, pos_t: int, pos_next: int) -> pd.Series:
-        """
-        y_i = sum of daily returns from t+1 ... t_next (inclusive).
-        Requires at least 80% non-NaN.
-        """
         sl = returns.iloc[pos_t + 1 : pos_next + 1]
         minc = int(0.8 * len(sl)) if len(sl) > 0 else 1
-        y = sl.sum(axis=0, min_count=minc)
-        return y
+        return sl.sum(axis=0, min_count=minc)
 
     def _rebuild_scaler(self, X: np.ndarray) -> None:
         mu = np.nanmean(X, axis=0)
@@ -166,23 +110,26 @@ class SystematicMomentum(SortingStrategy):
             return X
         return (X - self._x_mean) / self._x_std
 
-    def _train_from_scratch(self) -> None:
+    def _train_one_round(self, epochs: int) -> None:
         X = np.vstack(self._X_cache)
-        y = np.concatenate(self._y_cache)
+        y_raw = np.concatenate(self._y_cache)
 
-        mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(y_raw)
         X = X[mask].astype(np.float32)
-        y = y[mask].astype(np.float32)
+        y_raw = y_raw[mask].astype(np.float32)
 
         if len(X) < 5000:
             return
 
+        y = (y_raw > 0).astype(np.float32)
+
         self._rebuild_scaler(X)
         X = self._transform_X(X).astype(np.float32)
 
-        self.model = _MLP(in_dim=self.in_dim, hidden=self.hidden).to(self.device)
-        optim = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        crit = nn.SmoothL1Loss()
+        pos_count = y.sum()
+        neg_count = len(y) - pos_count
+        pos_weight = torch.tensor([neg_count / max(pos_count, 1)], device=self.device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X).to(self.device),
@@ -191,15 +138,13 @@ class SystematicMomentum(SortingStrategy):
         dl = torch.utils.data.DataLoader(ds, batch_size=self.batch_size, shuffle=True, drop_last=False)
 
         self.model.train()
-        for _ in range(self.epochs_first):
+        for _ in range(epochs):
             for xb, yb in dl:
-                pred = self.model(xb)
-                loss = crit(pred, yb)
-                optim.zero_grad()
+                logits = self.model(xb)
+                loss = criterion(logits, yb)
+                self.optim.zero_grad()
                 loss.backward()
-                optim.step()
-
-        self._trained_once = True
+                self.optim.step()
 
     def _fit(self, training_data: TrainingData) -> None:
         super()._fit(training_data)
@@ -221,25 +166,23 @@ class SystematicMomentum(SortingStrategy):
         pos_prev = returns.index.get_loc(t_prev)
         pos_cur = returns.index.get_loc(t_cur)
 
-        X_df = self._compute_features(returns, pos_prev)
-        y_ser = self._next_month_target(returns, pos_prev, pos_cur)
-
-        X_df = X_df.reindex(index=returns.columns)
-        y_ser = y_ser.reindex(index=returns.columns)
-
-        X = X_df.to_numpy()
-        y = y_ser.to_numpy()
+        X_df = self._momentum_features_at(returns, pos_prev).reindex(index=returns.columns)
+        y_ser = self._next_month_target(returns, pos_prev, pos_cur).reindex(index=returns.columns)
 
         self._train_dates.append(t_prev)
-        self._X_cache.append(X)
-        self._y_cache.append(y)
+        self._X_cache.append(X_df.to_numpy())
+        self._y_cache.append(y_ser.to_numpy())
 
         if len(self._train_dates) > self.train_months:
             self._train_dates.pop(0)
             self._X_cache.pop(0)
             self._y_cache.pop(0)
 
-        self._train_from_scratch()
+        if not self._trained_once:
+            self._train_one_round(self.epochs_first)
+            self._trained_once = True
+        else:
+            self._train_one_round(self.epochs_update)
 
     def get_scores(self, data: TrainingData) -> pd.Series:
         returns = data.simple_total_returns
@@ -251,22 +194,14 @@ class SystematicMomentum(SortingStrategy):
             return self.sign * scores
 
         pos_cur = len(returns.index) - 1
-        X_cur_df = self._compute_features(returns, pos_cur).reindex(index=returns.columns)
-        X_cur = X_cur_df.to_numpy()
-
+        X_cur = self._momentum_features_at(returns, pos_cur).reindex(index=returns.columns).to_numpy()
         X_cur = self._transform_X(X_cur).astype(np.float32)
 
         self.model.eval()
         with torch.no_grad():
             x_t = torch.from_numpy(X_cur).to(self.device)
-            pred = self.model(x_t).cpu().numpy()
+            logits = self.model(x_t).cpu().numpy()
 
-        scores = pd.Series(pred, index=returns.columns)
-
-        if self.as_zscore:
-            m = scores.mean(skipna=True)
-            s = scores.std(skipna=True)
-            if s > 1e-9:
-                scores = (scores - m) / s
-
+        proba = 1.0 / (1.0 + np.exp(-logits))
+        scores = pd.Series(proba, index=returns.columns)
         return self.sign * scores
