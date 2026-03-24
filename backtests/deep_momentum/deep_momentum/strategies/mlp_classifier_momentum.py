@@ -13,14 +13,17 @@ import torch.nn as nn
 from quant_pml.strategies.factors.sorting_strategy import SortingStrategy
 
 
-class _MLP(nn.Module):
-    def __init__(self, in_dim: int = 3, hidden: int = 32) -> None:
+class _MLPClassifier(nn.Module):
+    # ОБНОВЛЕНИЕ: in_dim по умолчанию теперь 6
+    def __init__(self, in_dim: int = 6, hidden: int = 64, dropout: float = 0.3) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
 
@@ -28,23 +31,23 @@ class _MLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class SystematicMomentum(SortingStrategy):
+class MLPClassifierMomentum(SortingStrategy):
     def __init__(  # noqa: PLR0913
         self,
         mode: str,
         sign: int = 1,
         *,
-        as_zscore: bool = False,
         quantile: float | None = None,
         n_holdings: int | None = None,
         weighting_scheme: str = "equally_weighted",
         train_months: int = 60,
-        hidden: int = 32,
+        hidden: int = 64,
+        dropout: float = 0.3,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
-        batch_size: int = 8192,
-        epochs_first: int = 5,
-        epochs_update: int = 1,
+        batch_size: int = 4096,
+        epochs_first: int = 10,
+        epochs_update: int = 2,
         exclude_td: int = 21,
     ) -> None:
         super().__init__(
@@ -54,61 +57,66 @@ class SystematicMomentum(SortingStrategy):
             weighting_scheme=weighting_scheme,
         )
         self.sign = sign
-        self.as_zscore = as_zscore
-
         self.train_months = train_months
         self.batch_size = batch_size
         self.epochs_first = epochs_first
         self.epochs_update = epochs_update
         self.exclude_td = exclude_td
 
-        self.device = torch.device("cpu")
-        self.model = _MLP(in_dim=3, hidden=hidden).to(self.device)
+        # Автоматическое определение устройства (GPU, если доступно)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[MLPClassifierMomentum] Using device: {self.device}")
+        
+        # ОБНОВЛЕНИЕ: передаем in_dim=6
+        self.model = _MLPClassifier(in_dim=6, hidden=hidden, dropout=dropout).to(self.device)
         self.optim = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        self.crit = nn.SmoothL1Loss()  # Huber
 
         self._trained_once = False
-
         self._train_dates: list[pd.Timestamp] = []
-        self._X_cache: list[np.ndarray] = []  # each: [n_assets, 3]
-        self._y_cache: list[np.ndarray] = []  # each: [n_assets]
+        self._X_cache: list[np.ndarray] = []
+        self._y_cache: list[np.ndarray] = []
         self._x_mean: np.ndarray | None = None
         self._x_std: np.ndarray | None = None
 
     @staticmethod
     def _month_ends(dates: pd.DatetimeIndex) -> list[pd.Timestamp]:
         s = pd.Series(dates, index=dates)
-        month_ends = s.groupby(dates.to_period("M")).max().tolist()
-        return month_ends
+        return s.groupby(dates.to_period("M")).max().tolist()
 
+    # --- ОБНОВЛЕНИЕ: Метод генерации признаков ---
     def _momentum_features_at(self, returns: pd.DataFrame, pos: int) -> pd.DataFrame:
-        """
-        Returns DataFrame [assets x 3] with columns [r12, r6, r3] at index position pos (rebalance date).
-        Uses min_count to avoid assets with too many NaNs.
-        """
         exc = self.exclude_td
 
         def window_sum(win: int) -> pd.Series:
             sl = returns.iloc[pos - win - exc : pos - exc]
             return sl.sum(axis=0, min_count=int(0.8 * win))
+            
+        def window_std(win: int) -> pd.Series:
+            sl = returns.iloc[pos - win - exc : pos - exc]
+            # Стандартное отклонение за период (волатильность)
+            return sl.std(axis=0, ddof=1) * np.sqrt(252) # Годовая волатильность
 
+        # Старые фичи
         r12 = window_sum(252)
         r6 = window_sum(126)
         r3 = window_sum(63)
+        
+        # Новые фичи
+        r1 = window_sum(21) # Доходность за последний месяц
+        vol1 = window_std(21) # Волатильность за последний месяц
+        
+        # Отношение доходности к волатильности (защита от деления на ноль)
+        vol1_safe = np.where(vol1 < 1e-6, 1e-6, vol1)
+        r6_vol = r6 / vol1_safe
 
-        X = pd.concat([r12, r6, r3], axis=1)
-        X.columns = ["r12", "r6", "r3"]
+        X = pd.concat([r12, r6, r3, r1, vol1, r6_vol], axis=1)
+        X.columns = ["r12", "r6", "r3", "r1", "vol1", "r6_vol"]
         return X
 
     def _next_month_target(self, returns: pd.DataFrame, pos_t: int, pos_next: int) -> pd.Series:
-        """
-        y_i = sum of daily returns from t+1 ... t_next (inclusive).
-        Requires at least 80% non-NaN.
-        """
         sl = returns.iloc[pos_t + 1 : pos_next + 1]
         minc = int(0.8 * len(sl)) if len(sl) > 0 else 1
-        y = sl.sum(axis=0, min_count=minc)
-        return y
+        return sl.sum(axis=0, min_count=minc)
 
     def _rebuild_scaler(self, X: np.ndarray) -> None:
         mu = np.nanmean(X, axis=0)
@@ -123,18 +131,25 @@ class SystematicMomentum(SortingStrategy):
         return (X - self._x_mean) / self._x_std
 
     def _train_one_round(self, epochs: int) -> None:
-        X = np.vstack(self._X_cache)  # [M*N, 3]
-        y = np.concatenate(self._y_cache)  # [M*N]
+        X = np.vstack(self._X_cache)
+        y_raw = np.concatenate(self._y_cache)
 
-        mask = np.isfinite(X).all(axis=1) & np.isfinite(y)
+        mask = np.isfinite(X).all(axis=1) & np.isfinite(y_raw)
         X = X[mask].astype(np.float32)
-        y = y[mask].astype(np.float32)
+        y_raw = y_raw[mask].astype(np.float32)
 
         if len(X) < 5000:
             return
 
+        y = (y_raw > 0).astype(np.float32)
+
         self._rebuild_scaler(X)
         X = self._transform_X(X).astype(np.float32)
+
+        pos_count = y.sum()
+        neg_count = len(y) - pos_count
+        pos_weight = torch.tensor([neg_count / max(pos_count, 1)], device=self.device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
         ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X).to(self.device),
@@ -145,8 +160,8 @@ class SystematicMomentum(SortingStrategy):
         self.model.train()
         for _ in range(epochs):
             for xb, yb in dl:
-                pred = self.model(xb)
-                loss = self.crit(pred, yb)
+                logits = self.model(xb)
+                loss = criterion(logits, yb)
                 self.optim.zero_grad()
                 loss.backward()
                 self.optim.step()
@@ -171,18 +186,12 @@ class SystematicMomentum(SortingStrategy):
         pos_prev = returns.index.get_loc(t_prev)
         pos_cur = returns.index.get_loc(t_cur)
 
-        X_df = self._momentum_features_at(returns, pos_prev)  # [assets x 3]
-        y_ser = self._next_month_target(returns, pos_prev, pos_cur)  # [assets]
-
-        X_df = X_df.reindex(index=returns.columns)
-        y_ser = y_ser.reindex(index=returns.columns)
-
-        X = X_df.to_numpy()
-        y = y_ser.to_numpy()
+        X_df = self._momentum_features_at(returns, pos_prev).reindex(index=returns.columns)
+        y_ser = self._next_month_target(returns, pos_prev, pos_cur).reindex(index=returns.columns)
 
         self._train_dates.append(t_prev)
-        self._X_cache.append(X)
-        self._y_cache.append(y)
+        self._X_cache.append(X_df.to_numpy())
+        self._y_cache.append(y_ser.to_numpy())
 
         if len(self._train_dates) > self.train_months:
             self._train_dates.pop(0)
@@ -197,30 +206,23 @@ class SystematicMomentum(SortingStrategy):
 
     def get_scores(self, data: TrainingData) -> pd.Series:
         returns = data.simple_total_returns
-        if returns is None or len(returns) < (252 + self.exclude_td + 5):
-            r1 = returns.iloc[-252 - 21 : -21].sum(axis=0)
-            r2 = returns.iloc[-126 - 21 : -21].sum(axis=0)
+        if returns is None or len(returns) < (252 + self.exclude_td + 5) or not self._trained_once:
+            # Fallback (для первых шагов)
+            r12 = returns.iloc[-252 - 21 : -21].sum(axis=0)
+            r6 = returns.iloc[-126 - 21 : -21].sum(axis=0)
             r3 = returns.iloc[-63 - 21 : -21].sum(axis=0)
-            scores = 0.5 * r1 + 0.3 * r2 + 0.2 * r3
+            scores = 0.5 * r12 + 0.3 * r6 + 0.2 * r3
             return self.sign * scores
 
         pos_cur = len(returns.index) - 1
-        X_cur_df = self._momentum_features_at(returns, pos_cur).reindex(index=returns.columns)
-        X_cur = X_cur_df.to_numpy()
-
+        X_cur = self._momentum_features_at(returns, pos_cur).reindex(index=returns.columns).to_numpy()
         X_cur = self._transform_X(X_cur).astype(np.float32)
 
         self.model.eval()
         with torch.no_grad():
             x_t = torch.from_numpy(X_cur).to(self.device)
-            pred = self.model(x_t).cpu().numpy()
+            logits = self.model(x_t).cpu().numpy()
 
-        scores = pd.Series(pred, index=returns.columns)
-
-        if self.as_zscore:
-            m = scores.mean(skipna=True)
-            s = scores.std(skipna=True)
-            if s > 1e-9:
-                scores = (scores - m) / s
-
+        proba = 1.0 / (1.0 + np.exp(-logits))
+        scores = pd.Series(proba, index=returns.columns)
         return self.sign * scores

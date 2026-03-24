@@ -9,3 +9,4 @@ data/
 datasets/
 *.csv
 *.parquet
+*.gz
