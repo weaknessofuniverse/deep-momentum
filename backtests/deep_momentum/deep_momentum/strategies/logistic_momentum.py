@@ -22,7 +22,7 @@ class LogisticMomentum(SortingStrategy):
         n_holdings: int | None = None,
         weighting_scheme: str = "equally_weighted",
         train_months: int = 60,
-        C: float = 1.0,
+        C: float = 0.1,
         exclude_td: int = 21,
     ) -> None:
         super().__init__(
@@ -38,8 +38,8 @@ class LogisticMomentum(SortingStrategy):
 
         self.model = LogisticRegression(
             C=C,
-            penalty="l2",
-            solver="lbfgs",
+            penalty="l1",
+            solver="liblinear",
             max_iter=1000,
             class_weight="balanced",
         )

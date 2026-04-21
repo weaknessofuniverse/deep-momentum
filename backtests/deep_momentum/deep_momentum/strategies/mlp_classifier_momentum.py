@@ -14,14 +14,15 @@ from quant_pml.strategies.factors.sorting_strategy import SortingStrategy
 
 
 class _MLPClassifier(nn.Module):
-    # ОБНОВЛЕНИЕ: in_dim по умолчанию теперь 6
-    def __init__(self, in_dim: int = 6, hidden: int = 64, dropout: float = 0.3) -> None:
+    def __init__(self, in_dim: int = 3, hidden: int = 8, dropout: float = 0.5) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
@@ -63,12 +64,8 @@ class MLPClassifierMomentum(SortingStrategy):
         self.epochs_update = epochs_update
         self.exclude_td = exclude_td
 
-        # Автоматическое определение устройства (GPU, если доступно)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[MLPClassifierMomentum] Using device: {self.device}")
-        
-        # ОБНОВЛЕНИЕ: передаем in_dim=6
-        self.model = _MLPClassifier(in_dim=6, hidden=hidden, dropout=dropout).to(self.device)
+        self.device = torch.device("cpu")
+        self.model = _MLPClassifier(in_dim=3, hidden=hidden, dropout=dropout).to(self.device)
         self.optim = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
         self._trained_once = False
@@ -83,34 +80,19 @@ class MLPClassifierMomentum(SortingStrategy):
         s = pd.Series(dates, index=dates)
         return s.groupby(dates.to_period("M")).max().tolist()
 
-    # --- ОБНОВЛЕНИЕ: Метод генерации признаков ---
     def _momentum_features_at(self, returns: pd.DataFrame, pos: int) -> pd.DataFrame:
         exc = self.exclude_td
 
         def window_sum(win: int) -> pd.Series:
             sl = returns.iloc[pos - win - exc : pos - exc]
             return sl.sum(axis=0, min_count=int(0.8 * win))
-            
-        def window_std(win: int) -> pd.Series:
-            sl = returns.iloc[pos - win - exc : pos - exc]
-            # Стандартное отклонение за период (волатильность)
-            return sl.std(axis=0, ddof=1) * np.sqrt(252) # Годовая волатильность
 
-        # Старые фичи
         r12 = window_sum(252)
         r6 = window_sum(126)
         r3 = window_sum(63)
-        
-        # Новые фичи
-        r1 = window_sum(21) # Доходность за последний месяц
-        vol1 = window_std(21) # Волатильность за последний месяц
-        
-        # Отношение доходности к волатильности (защита от деления на ноль)
-        vol1_safe = np.where(vol1 < 1e-6, 1e-6, vol1)
-        r6_vol = r6 / vol1_safe
 
-        X = pd.concat([r12, r6, r3, r1, vol1, r6_vol], axis=1)
-        X.columns = ["r12", "r6", "r3", "r1", "vol1", "r6_vol"]
+        X = pd.concat([r12, r6, r3], axis=1)
+        X.columns = ["r12", "r6", "r3"]
         return X
 
     def _next_month_target(self, returns: pd.DataFrame, pos_t: int, pos_next: int) -> pd.Series:
@@ -207,7 +189,6 @@ class MLPClassifierMomentum(SortingStrategy):
     def get_scores(self, data: TrainingData) -> pd.Series:
         returns = data.simple_total_returns
         if returns is None or len(returns) < (252 + self.exclude_td + 5) or not self._trained_once:
-            # Fallback (для первых шагов)
             r12 = returns.iloc[-252 - 21 : -21].sum(axis=0)
             r6 = returns.iloc[-126 - 21 : -21].sum(axis=0)
             r3 = returns.iloc[-63 - 21 : -21].sum(axis=0)

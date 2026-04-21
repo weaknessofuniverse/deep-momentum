@@ -10,3 +10,30 @@ datasets/
 *.csv
 *.parquet
 *.gz
+quant-packages
+quant-packages.zip
+
+# Reports, write-ups, PDFs
+*.pdf
+*.tex
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+refs.bib
+report_experiments.md
+report_experiments.ipynb
+graphics/
+
+# Backtest outputs/artifacts
+backtests/deep_momentum/backtests/precomputed/
+
+# Draft / experimental strategy duplicates
+backtests/deep_momentum/deep_momentum/strategies/systematic_momentum-2.py
